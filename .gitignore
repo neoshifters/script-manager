@@ -1,0 +1,33 @@
+# 编译产物
+script-manager.exe
+script-manager-linux-amd64
+script-manager-linux-arm64
+script-manager-darwin-*
+*.exe
+*.test
+
+# 运行数据与测试数据（包含视频，体积大且含个人内容）
+data/
+脚本管理/
+drafts/
+bin/
+设置.json
+_脚本状态.json
+协同.json
+*.log
+
+# 本地环境变量
+.env
+.env.*
+
+# 仅供内部环境的文档，未纳入公开仓库
+飞牛NAS-Docker安装指南.md
+Docker更新方法.md
+远程访问指南.md
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

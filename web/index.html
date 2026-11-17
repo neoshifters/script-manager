@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>脚本管理</title>
+<script>
+/* 先于样式生效读取上次的主题，避免刷新时闪一下默认配色 */
+(function () {
+  try {
+    var t = localStorage.getItem('sm.theme');
+    if (t === 'light' || t === 'dark' || t === 'sepia') {
+      document.documentElement.dataset.theme = t;
+    } else if (t === 'custom') {
+      var c = JSON.parse(localStorage.getItem('sm.theme.custom') || 'null');
+      if (c && c.bg && c.accent) {
+        document.documentElement.dataset.theme = 'custom';
+        document.documentElement.style.colorScheme = c.base === 'dark' ? 'dark' : 'light';
+        var vars = c.vars || {};
+        for (var k in vars) {
+          if (Object.prototype.hasOwnProperty.call(vars, k)) {
+            document.documentElement.style.setProperty(k, vars[k]);
+          }
+        }
+      }
+    }
+  } catch (e) {}
+})();
+</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234c8dff'/%3E%3Cpath d='M9 11h14M9 16h10M9 21h7' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="bgLayer" class="bg-layer" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">脚</span>
+    <span class="brand-name">脚本管理</span>
+    <span class="brand-stage">阶段三</span>
+  </div>
+  <div class="product-switch">
+    <span class="switch-label">产品</span>
+    <select id="productSelect" class="product-select" aria-label="切换产品"></select>
+    <button id="addProduct" class="ghost-btn" title="新建产品">+ 产品</button>
+  </div>
+  <div class="theme-wrap">
+    <div class="theme-switch" role="group" aria-label="界面风格">
+      <button type="button" class="theme-btn" data-theme-btn="light" title="白天风格" aria-label="白天风格" aria-pressed="true">☀️</button>
+      <button type="button" class="theme-btn" data-theme-btn="dark" title="夜晚风格" aria-label="夜晚风格" aria-pressed="false">🌙</button>
+      <button type="button" class="theme-btn" data-theme-btn="sepia" title="护眼风格" aria-label="护眼风格" aria-pressed="false">📖</button>
+      <button type="button" class="theme-btn" data-theme-btn="custom" title="自定义配色" aria-label="自定义配色" aria-pressed="false">🎨</button>
+    </div>
+    <div id="themePanel" class="theme-panel hidden">
+      <div class="theme-panel-head">
+        <span>自定义配色</span>
+        <span class="theme-panel-tip">改完自动保存</span>
+      </div>
+      <div class="theme-grid">
+        <label class="theme-row" for="customBg">
+          <span>背景色</span>
+          <input id="customBg" class="color-input" type="color" value="#ffffff">
+        </label>
+        <label class="theme-row" for="customText">
+          <span>文字色</span>
+          <input id="customText" class="color-input" type="color" value="#1b2430">
+        </label>
+        <label class="theme-row" for="customPanel">
+          <span>面板色</span>
+          <input id="customPanel" class="color-input" type="color" value="#ffffff">
+        </label>
+        <label class="theme-row" for="customAccent">
+          <span>强调色</span>
+          <input id="customAccent" class="color-input" type="color" value="#2f6ae0">
+        </label>
+      </div>
+      <label class="theme-row theme-range" for="customRadius">
+        <span>圆角</span>
+        <input id="customRadius" type="range" min="0" max="16" step="1" value="8">
+        <b id="customRadiusVal">8</b>
+      </label>
+      <label class="theme-row theme-range" for="customFont">
+        <span>字号</span>
+        <input id="customFont" type="range" min="11" max="18" step="1" value="13">
+        <b id="customFontVal">13</b>
+      </label>
+      <div class="theme-sub">图片背景</div>
+      <div class="theme-row theme-img-row">
+        <button id="customImgPick" class="theme-link" type="button">选择图片</button>
+        <button id="customImgClear" class="theme-link" type="button">移除</button>
+      </div>
+      <label class="theme-row theme-range" for="customImgOpacity">
+        <span>透明度</span>
+        <input id="customImgOpacity" type="range" min="4" max="40" step="2" value="18">
+        <b id="customImgOpacityVal">18%</b>
+      </label>
+      <input id="customImgFile" type="file" accept="image/*" hidden>
+      <div class="theme-sub">我的配色</div>
+      <div id="customPalettes" class="palette-list"></div>
+      <div class="theme-panel-actions">
+        <button id="customSavePalette" class="text-btn" type="button">保存当前配色</button>
+        <button id="customReset" class="text-btn" type="button">恢复默认</button>
+      </div>
+    </div>
+  </div>
+  <div class="top-right">
+    <button id="panelToggle" class="ghost-btn panel-toggle" type="button" aria-expanded="false" title="展开 / 收起剪辑素材面板">剪辑素材</button>
+    <button id="mobileMenuBtn" class="ghost-btn mobile-only" type="button" aria-expanded="false" aria-controls="mobileMenu">菜单</button>
+    <button id="ffStatus" class="ff-chip" type="button" title="查看 / 设置 ffmpeg 路径">检测 ffmpeg…</button>
+    <span id="syncState" class="sync-chip">协作连接中…</span>
+    <span id="peers" class="presence-chip" title="同一脚本的在线同事"></span>
+    <span id="saveStatus" class="save-status">就绪</span>
+  </div>
+</header>
+
+<!-- 手机端「更多」菜单：收拢主题、剪辑面板、历史等入口，桌面端不显示 -->
+<div id="mobileMenu" class="mobile-menu hidden" role="dialog" aria-label="更多操作">
+  <div class="mobile-menu-card">
+    <div class="mobile-menu-head">
+      <span>更多</span>
+      <button id="mobileMenuClose" class="mini-btn" type="button">关闭</button>
+    </div>
+    <div class="mobile-menu-label">界面风格</div>
+    <div class="mobile-theme-row">
+      <button class="theme-btn mobile-theme" data-mobile-theme="light" type="button">☀️ 白天</button>
+      <button class="theme-btn mobile-theme" data-mobile-theme="dark" type="button">🌙 夜晚</button>
+      <button class="theme-btn mobile-theme" data-mobile-theme="sepia" type="button">📖 护眼</button>
+      <button class="theme-btn mobile-theme" data-mobile-theme="custom" type="button">🎨 自定义</button>
+    </div>
+    <div class="mobile-menu-label">操作</div>
+    <button class="mobile-menu-item" id="mExport" type="button">导出草稿到剪映</button>
+    <button class="mobile-menu-item" id="mPanel" type="button">剪辑素材面板</button>
+    <button class="mobile-menu-item" id="mHistory" type="button">修改历史</button>
+    <button class="mobile-menu-item" id="mRenumber" type="button">重排序号</button>
+    <button class="mobile-menu-item" id="mFfmpeg" type="button">ffmpeg 设置</button>
+  </div>
+</div>
+
+<div class="workspace">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <span>文案列表</span>
+      <div class="sidebar-head-actions">
+        <button id="addScript" class="mini-btn" title="新建脚本">+ 新建</button>
+        <button id="sidebarToggle" class="mini-btn sidebar-toggle" type="button" title="收起列表" aria-label="收起列表">«</button>
+      </div>
+    </div>
+    <div class="sidebar-tools">
+      <input id="scriptSearch" class="search-input" type="text" autocomplete="off" placeholder="搜索名称 / 镜头内容" aria-label="搜索脚本名称或镜头内容">
+      <div class="usage-tabs" id="usageTabs" role="group" aria-label="按使用状态筛选">
+        <button type="button" class="usage-tab active" data-usage="all">全部</button>
+        <button type="button" class="usage-tab" data-usage="used">使用</button>
+        <button type="button" class="usage-tab" data-usage="unused">未使用</button>
+      </div>
+      <select id="scriptFilter" class="filter-select" aria-label="按产品筛选"></select>
+    </div>
+    <div id="searchResults" class="search-results hidden"></div>
+    <div id="scriptList" class="script-list"></div>
+    <div class="sidebar-foot">数据保存在「脚本管理」目录</div>
+  </aside>
+
+  <main class="center">
+    <div id="emptyState" class="empty-state hidden"></div>
+    <section id="editor" class="editor hidden">
+      <div class="editor-head">
+        <div class="title-block">
+          <button id="mobileBack" class="ghost-btn mobile-only mobile-back" type="button" aria-label="返回脚本列表">‹ 列表</button>
+          <span class="crumb" id="crumbProduct"></span>
+          <span class="crumb-sep">/</span>
+          <h1 id="scriptTitle" class="script-title"></h1>
+          <span class="shot-count" id="shotCount"></span>
+        </div>
+        <div class="head-actions">
+          <button id="historyBtn" class="ghost-btn" type="button" title="查看谁在什么时候改了什么，并回滚到某个时间点">历史</button>
+          <button id="renumberBtn" class="ghost-btn" type="button" title="按当前表格行顺序把镜头序号重排为 1..N">重排序号</button>
+          <button id="exportBtn" class="ghost-btn" type="button" title="导出草稿到剪映，或下载 CSV / 时间码文案">导出</button>
+          <span class="head-tip">空格 播放 · S 打点 · A/D 逐帧 · F 剪辑面板 · Esc 退出预览</span>
+        </div>
+      </div>
+      <div id="batchBar" class="batch-bar hidden">
+        <span id="batchCount" class="batch-count">已选 0 个镜头</span>
+        <button id="batchSlice" class="mini-btn" type="button">批量打点切片</button>
+        <button id="batchDelete" class="mini-btn danger" type="button">批量删除</button>
+        <button id="batchClear" class="mini-btn" type="button">取消选择</button>
+      </div>
+      <div class="table-scroll">
+        <div class="table">
+          <div class="thead">
+            <div class="th pick"><input id="selectAll" class="pick-box" type="checkbox" aria-label="全选镜头"></div>
+            <div class="th">镜头序号</div>
+            <div class="th">镜头内容</div>
+            <div class="th">口播</div>
+            <div class="th">文案</div>
+            <div class="th">视频片段</div>
+          </div>
+          <div id="rows" class="rows"></div>
+          <button id="addRow" class="add-row" title="新增一行">
+            <span class="plus">+</span>
+          </button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <aside class="panel" id="clipPanel">
+    <div class="panel-head">
+      <div>
+        <div class="panel-title">剪辑素材</div>
+        <div class="panel-sub">拖入原片，按画面挑片段</div>
+      </div>
+      <div class="panel-head-actions">
+        <span class="panel-stage">智能裁切</span>
+        <button id="panelClose" class="mini-btn panel-close" type="button" title="收起面板（F）" aria-label="收起剪辑面板">×</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div id="clipDrop" class="clip-drop">
+        <div class="drop-icon">＋</div>
+        <div class="drop-title">拖入一个视频</div>
+        <div class="drop-sub">或点击选择文件</div>
+        <input type="file" id="clipFile" accept="video/*" hidden>
+      </div>
+
+      <div id="clipEditor" class="clip-editor hidden">
+        <div class="clip-video-wrap" id="clipVideoWrap">
+          <video id="clipVideo" playsinline preload="auto"></video>
+          <div class="clip-play-hint" id="clipPlayHint">▶</div>
+          <div class="clip-name" id="clipName"></div>
+        </div>
+
+        <div class="clip-toolbar">
+          <button class="tool-btn" data-clip-act="back" title="左一帧（A）">◀ A</button>
+          <button class="tool-btn mark" data-clip-act="mark" title="在当前时间打点（S）">S 打点</button>
+          <button class="tool-btn" data-clip-act="fwd" title="右一帧（D）">D ▶</button>
+        </div>
+
+        <div class="timeline" id="timeline" title="点击跳转">
+          <div class="tl-progress" id="tlProgress"></div>
+          <div class="tl-cuts" id="tlCuts"></div>
+        </div>
+
+        <div class="clip-meta">
+          <span class="timecode" id="clipTime">00:00.00 / 00:00.00</span>
+          <span class="fps-tag" id="clipFps"></span>
+          <div class="meta-actions">
+            <button id="clearCuts" class="text-btn">清除打点</button>
+            <button id="changeClip" class="text-btn">更换视频</button>
+          </div>
+        </div>
+
+        <div class="cut-row">
+          <select id="cutSensitivity" class="mini-select" aria-label="切点灵敏度" title="切点灵敏度">
+            <option value="0.38">切点少</option>
+            <option value="0.30" selected>标准</option>
+            <option value="0.22">切点密</option>
+          </select>
+          <button id="smartCut" class="smart-cut" disabled title="按画面变化自动识别切点">智能裁切</button>
+        </div>
+
+        <div class="seg-head">
+          <span>片段</span>
+          <span id="segCount" class="seg-count">0</span>
+        </div>
+        <div id="segments" class="segments"></div>
+        <div class="panel-hint">点击片段预览 · 拖到左侧「视频片段」格会按镜头序号落盘</div>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<div id="uploadBox" class="upload-box hidden">
+  <div class="upload-head">
+    <span>上传队列</span>
+    <span id="uploadCount" class="upload-count"></span>
+    <button id="uploadToggle" class="mini-btn" type="button" title="暂停 / 继续上传队列">暂停</button>
+  </div>
+  <div id="uploadList" class="upload-list"></div>
+</div>
+
+<div id="overlay" class="overlay hidden">
+  <div class="overlay-stage" id="overlayStage">
+    <video id="ovVideo" playsinline></video>
+    <div class="ov-badge" id="ovLabel"></div>
+    <button class="ov-play" id="ovPlay">▶</button>
+    <div class="ov-bar">
+      <span id="ovTime">00:00.00 / 00:00.00</span>
+      <span class="ov-hint">点击画面播放 / 暂停 · 空格 切换 · Esc 或点击画面外退出</span>
+    </div>
+    <div class="ov-progress"><div id="ovProgress"></div></div>
+  </div>
+</div>
+
+<div id="modal" class="modal hidden">
+  <form class="modal-card" id="modalForm">
+    <h2 id="modalTitle">新建</h2>
+    <p id="modalDesc" class="modal-desc"></p>
+    <input id="modalInput" class="modal-input" type="text" autocomplete="off">
+    <div id="modalError" class="modal-error hidden"></div>
+    <div class="modal-actions">
+      <button type="button" id="modalCancel" class="btn">取消</button>
+      <button type="submit" id="modalConfirm" class="btn primary">创建</button>
+    </div>
+  </form>
+</div>
+
+<div id="settingsModal" class="modal hidden">
+  <form class="modal-card settings-card" id="settingsForm">
+    <h2>ffmpeg 设置</h2>
+    <p class="modal-desc">智能裁切与按镜头切片需要 ffmpeg / ffprobe。程序会自动在系统 PATH、程序目录、数据目录 bin 下查找；找不到时可在这里手动指定绝对路径。</p>
+    <label class="field-label" for="setFfmpeg">ffmpeg 路径</label>
+    <input id="setFfmpeg" class="modal-input" type="text" autocomplete="off" placeholder="例如 C:\ffmpeg\bin\ffmpeg.exe">
+    <label class="field-label" for="setFfprobe">ffprobe 路径</label>
+    <input id="setFfprobe" class="modal-input" type="text" autocomplete="off" placeholder="留空则在 ffmpeg 同目录自动查找">
+    <div id="ffDetectInfo" class="ff-detect"></div>
+    <div class="settings-sep"></div>
+    <h3 class="settings-sub">剪映草稿导出</h3>
+    <p class="settings-note">草稿里的素材必须用运行剪映的 Windows 能访问的路径。把 NAS 的草稿目录映射成 Windows 盘符后，填好下面三项即可。</p>
+    <label class="field-label" for="setDraftRoot">草稿根目录（容器内路径）</label>
+    <input id="setDraftRoot" class="modal-input" type="text" autocomplete="off" placeholder="/drafts/JianyingPro Drafts">
+    <label class="field-label" for="setNasPrefix">NAS 路径前缀</label>
+    <input id="setNasPrefix" class="modal-input" type="text" autocomplete="off" placeholder="/drafts">
+    <label class="field-label" for="setWinPrefix">Windows 路径前缀</label>
+    <input id="setWinPrefix" class="modal-input" type="text" autocomplete="off" placeholder="Z:\">
+    <div id="settingsError" class="modal-error hidden"></div>
+    <div class="modal-actions">
+      <button type="button" id="settingsCancel" class="btn">取消</button>
+      <button type="submit" class="btn primary">保存并检测</button>
+    </div>
+  </form>
+</div>
+
+<div id="exportModal" class="modal export-modal hidden" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
+  <div class="modal-card export-card">
+    <div class="export-head">
+      <h2 id="exportTitle">导出草稿到剪映</h2>
+      <button id="exportClose" class="mini-btn" type="button">关闭</button>
+    </div>
+    <p id="exportTarget" class="export-sub">正在读取当前脚本…</p>
+
+    <div id="exportPrecheck" class="export-precheck">正在预检…</div>
+
+    <label id="exportTemplateRow" class="export-template-row hidden" for="exportTemplate">
+      <span>模板草稿</span>
+      <select id="exportTemplate" class="filter-select" aria-label="选择用作模板的草稿"></select>
+    </label>
+    <div id="exportTemplateNote" class="export-template-note hidden"></div>
+
+    <div class="export-actions">
+      <button id="exportDraftBtn" class="btn primary" type="button">生成剪映草稿</button>
+      <button id="exportCsvBtn" class="btn" type="button">下载 CSV + 时间码文案</button>
+      <button id="exportRecheck" class="text-btn" type="button">重新预检</button>
+    </div>
+
+    <div id="exportResult" class="export-result hidden"></div>
+
+    <div id="exportPathBar" class="export-pathbar hidden">
+      <div class="export-path-row"><span>NAS 路径</span><code id="exportNasPath"></code></div>
+      <div class="export-path-row"><span>Windows 路径</span><code id="exportWinPath"></code></div>
+      <button id="exportCopy" class="mini-btn" type="button">复制路径</button>
+    </div>
+  </div>
+</div>
+
+<div id="historyModal" class="history-modal hidden">
+  <div class="history-card">
+    <div class="history-head">
+      <div>
+        <h2>修改历史</h2>
+        <p id="historySub" class="history-sub">最近 150 条改动</p>
+      </div>
+      <button id="historyClose" class="mini-btn" type="button">关闭</button>
+    </div>
+    <div id="historyList" class="history-list"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/collab.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

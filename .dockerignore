@@ -1,0 +1,7 @@
+script-manager.exe
+script-manager-linux-amd64
+script-manager-linux-arm64
+api_test.go
+部署说明.md
+*.md
+.git
