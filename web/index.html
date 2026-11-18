@@ -43,6 +43,7 @@
     <span class="switch-label">产品</span>
     <select id="productSelect" class="product-select" aria-label="切换产品"></select>
     <button id="addProduct" class="ghost-btn" title="新建产品">+ 产品</button>
+    <button id="delProduct" class="ghost-btn danger" title="删除当前产品及其文件夹">删除产品</button>
   </div>
   <div class="theme-wrap">
     <div class="theme-switch" role="group" aria-label="界面风格">
@@ -129,6 +130,8 @@
     </div>
     <div class="mobile-menu-label">操作</div>
     <button class="mobile-menu-item" id="mExport" type="button">导出草稿到剪映</button>
+    <button class="mobile-menu-item" id="mOrphans" type="button">清理未引用视频</button>
+    <button class="mobile-menu-item" id="mDelProduct" type="button">删除当前产品</button>
     <button class="mobile-menu-item" id="mPanel" type="button">剪辑素材面板</button>
     <button class="mobile-menu-item" id="mHistory" type="button">修改历史</button>
     <button class="mobile-menu-item" id="mRenumber" type="button">重排序号</button>
@@ -210,6 +213,7 @@
       </div>
       <div class="panel-head-actions">
         <span class="panel-stage">智能裁切</span>
+        <button id="orphanOpen" class="mini-btn" type="button" title="清理没有被任何脚本引用的视频文件">清理</button>
         <button id="panelClose" class="mini-btn panel-close" type="button" title="收起面板（F）" aria-label="收起剪辑面板">×</button>
       </div>
     </div>
@@ -357,6 +361,27 @@
       <div class="export-path-row"><span>NAS 路径</span><code id="exportNasPath"></code></div>
       <div class="export-path-row"><span>Windows 路径</span><code id="exportWinPath"></code></div>
       <button id="exportCopy" class="mini-btn" type="button">复制路径</button>
+    </div>
+  </div>
+</div>
+
+<div id="orphanModal" class="modal orphan-modal hidden" role="dialog" aria-modal="true" aria-labelledby="orphanTitle">
+  <div class="modal-card orphan-card">
+    <div class="export-head">
+      <h2 id="orphanTitle">清理未引用的视频</h2>
+      <button id="orphanClose" class="mini-btn" type="button">关闭</button>
+    </div>
+    <p class="export-sub">扫描数据目录里没有任何脚本引用的视频。默认只报告，勾选并确认后才会删除；删除后无法恢复，回滚到旧版本也不会恢复已删除的视频文件。剪映草稿目录不参与扫描，也不会被删除。</p>
+    <div id="orphanSummary" class="orphan-summary">正在扫描…</div>
+    <div class="orphan-toolbar">
+      <label class="orphan-checkall"><input id="orphanAll" type="checkbox"> 全选</label>
+      <span id="orphanSelected" class="orphan-selected"></span>
+    </div>
+    <div id="orphanList" class="orphan-list"></div>
+    <div id="orphanNote" class="orphan-note hidden"></div>
+    <div class="modal-actions">
+      <button id="orphanRescan" class="btn" type="button">重新扫描</button>
+      <button id="orphanDelete" class="btn danger" type="button" disabled>删除选中</button>
     </div>
   </div>
 </div>

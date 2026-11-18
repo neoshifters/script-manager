@@ -20,6 +20,8 @@ const (
 	historyFileName = "_历史.json"
 	historyLimit    = 150
 	maxHistoryBatch = 40
+	// 同一人、同一字段在这段时间内的连续输入只记一条，避免打字把历史刷屏。
+	historyMergeWindow = 8 * time.Second
 )
 
 type historyEntry struct {
@@ -76,6 +78,7 @@ func writeHistoryFile(path string, list []historyEntry) error {
 	return writeFileAtomic(path, b)
 }
 
+// trimHistory 保留最近 historyLimit 条。
 func trimHistory(list []historyEntry) []historyEntry {
 	if len(list) <= historyLimit {
 		return list
@@ -83,6 +86,25 @@ func trimHistory(list []historyEntry) []historyEntry {
 	out := make([]historyEntry, historyLimit)
 	copy(out, list[len(list)-historyLimit:])
 	return out
+}
+
+// appendHistoryEntries 把新条目接进历史：同一人、同一字段短时间内的连续「修改文案」
+// 类条目会就地合并（保留最早的旧值、更新新值和时间），其余照常追加。
+func appendHistoryEntries(list []historyEntry, entries []historyEntry) []historyEntry {
+	for _, e := range entries {
+		if (e.Kind == "text" || e.Kind == "no") && e.Key != "" && len(list) > 0 {
+			last := &list[len(list)-1]
+			if last.Kind == e.Kind && last.Key == e.Key && last.By == e.By &&
+				e.T-last.T <= int64(historyMergeWindow/time.Millisecond) {
+				last.T = e.T
+				last.At = e.At
+				last.Next = e.Next
+				continue
+			}
+		}
+		list = append(list, e)
+	}
+	return trimHistory(list)
 }
 
 func reverseHistory(list []historyEntry) {
@@ -112,17 +134,10 @@ func regText(v json.RawMessage) string {
 }
 
 // buildHistoryLocked 把一批生效的寄存器改动翻译成人类可读的历史记录。
+// 只按需读取涉及的寄存器，不做整篇投影，避免打字密集时反复全量 buildDoc。
 func (r *Room) buildHistoryLocked(deltas []regDelta, by string) []historyEntry {
-	doc := r.buildDocLocked("")
-	nos := make(map[string]string, len(doc.Shots))
-	for _, s := range doc.Shots {
-		nos[s.ID] = s.No
-	}
 	noFor := func(id string) string {
-		if v, ok := nos[id]; ok && strings.TrimSpace(v) != "" {
-			return v
-		}
-		if reg, ok := r.st.Regs["s|"+id+"|no"]; ok {
+		if reg, ok := r.st.Regs["s|"+id+"|no"]; ok && reg.V != nil {
 			var v string
 			if json.Unmarshal(reg.V, &v) == nil && strings.TrimSpace(v) != "" {
 				return v
@@ -206,7 +221,8 @@ func (r *Room) appendHistory(entries []historyEntry) {
 		return
 	}
 	r.mu.Lock()
-	r.hist = trimHistory(append(r.hist, entries...))
+	r.hist = appendHistoryEntries(r.hist, entries)
+	r.dirty = true
 	r.mu.Unlock()
 	r.scheduleSave()
 }
@@ -235,6 +251,8 @@ func (r *Room) findHistory(id string) (historyEntry, bool) {
 // rollbackBefore 撤销 t（含）之后的所有字段改动，返回涉及的字段数。
 func (r *Room) rollbackBefore(t int64, by string) int {
 	r.mu.Lock()
+	r.dirty = true
+	r.rev++
 	plans := make(map[string]historyEntry)
 	keys := make([]string, 0, 16)
 	for _, e := range r.hist {

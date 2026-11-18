@@ -450,6 +450,8 @@ select option { background: var(--panel); color: var(--text); }
   font-size: 12px;
 }
 .ghost-btn:hover { border-color: var(--accent); color: var(--text); background: var(--accent-soft); }
+.ghost-btn.danger { color: var(--danger); }
+.ghost-btn.danger:hover { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
 
 .top-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
 .save-status { font-size: 12px; color: var(--muted); transition: color 0.2s; }
@@ -710,6 +712,8 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 body.col-resizing * { cursor: col-resize !important; }
 
 .row { border-bottom: 1px solid var(--line-soft); transition: background 0.12s; }
+/* 长表格窗口化：超过一屏半的行数时由 JS 加 .virtualized，屏幕外的行跳过渲染 */
+.rows.virtualized .row { content-visibility: auto; contain-intrinsic-size: auto 120px; }
 .row:hover { background: var(--row-hover); }
 .row:last-of-type { border-bottom: none; }
 .row.selected { background: var(--accent-faint); }
@@ -1386,7 +1390,7 @@ body.col-resizing * { cursor: col-resize !important; }
   box-shadow: var(--shadow-md);
 }
 .modal-card h2 { margin: 0 0 6px; font-size: 16px; font-weight: 650; }
-.modal-desc { margin: 0 0 14px; color: var(--muted); font-size: 12px; }
+.modal-desc { margin: 0 0 14px; color: var(--muted); font-size: 12px; line-height: 1.7; white-space: pre-line; }
 .modal-input {
   width: 100%;
   height: 36px;
@@ -1401,6 +1405,66 @@ body.col-resizing * { cursor: col-resize !important; }
 .modal-input:focus { border-color: var(--accent); }
 .modal-error { margin-top: 8px; color: var(--danger); font-size: 11.5px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+
+/* ---------- 清理未引用的视频 ---------- */
+.orphan-modal { z-index: 105; }
+.orphan-card { width: 620px; max-width: calc(100% - 24px); }
+.orphan-card .export-sub { margin-bottom: 10px; }
+.orphan-summary { font-size: 12.5px; color: var(--text); line-height: 1.6; }
+.orphan-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.orphan-checkall { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.orphan-selected { font-variant-numeric: tabular-nums; }
+.orphan-list {
+  margin-top: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.orphan-empty { padding: 18px 12px; text-align: center; color: var(--faint); font-size: 12px; }
+.orphan-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+.orphan-row:last-child { border-bottom: none; }
+.orphan-main { flex: 1; min-width: 0; }
+.orphan-name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.orphan-sub {
+  display: block;
+  margin-top: 2px;
+  color: var(--faint);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.orphan-size { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.orphan-note {
+  margin-top: 10px;
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--muted);
+  white-space: pre-wrap;
+}
+.orphan-note.err { color: var(--danger); }
 
 /* ---------- 阶段二：ffmpeg 状态与设置 ---------- */
 .ff-chip {
@@ -2188,7 +2252,7 @@ body.col-resizing * { cursor: col-resize !important; }
   .theme-wrap { display: none; }
   .product-switch { flex: 1; min-width: 0; gap: 6px; }
   .product-select { min-width: 0; max-width: 100%; }
-  #addProduct { display: none; }
+  #addProduct, #delProduct { display: none; }
   .top-right { margin-left: 0; gap: 6px; }
   .panel-toggle, .ff-chip, .sync-chip, .presence-chip, .save-status { display: none; }
   .mobile-only { display: inline-flex; }
@@ -2222,6 +2286,16 @@ body.col-resizing * { cursor: col-resize !important; }
   }
   .export-precheck { max-height: 34vh; }
   .export-actions .btn { flex: 1 1 140px; }
+
+  /* 清理弹层同样贴底展示 */
+  .orphan-modal { align-items: flex-end; }
+  .orphan-card {
+    width: 100%;
+    max-height: 90vh;
+    border-radius: 14px 14px 0 0;
+    padding: 16px 14px calc(16px + env(safe-area-inset-bottom));
+  }
+  .orphan-list { max-height: 40vh; }
 
   /* ---------- 表格 → 竖排卡片 ---------- */
   .batch-bar { display: none; }

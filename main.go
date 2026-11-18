@@ -43,6 +43,22 @@ type App struct {
 	hubMu sync.Mutex
 	rooms map[string]*Room
 
+	// 视频文件清理串行化：全库引用扫描 + 删除同一时刻只允许一个
+	mediaMu sync.Mutex
+
+	// 联动清理的异步队列：编辑只登记候选，后台按固定间隔合并成一次全库核对
+	mediaQueueMu sync.Mutex
+	mediaQueue   map[string]*mediaCandidate
+
+	// 全库视频引用计数索引（带短缓存，任何写入都会让它失效）
+	mediaIdxMu sync.Mutex
+	mediaIdx   map[string]int
+	mediaIdxAt time.Time
+
+	// 全文搜索结果缓存：同一关键词短时间内复用，避免反复全库扫描
+	searchMu    sync.Mutex
+	searchCache map[string]searchCacheEntry
+
 	// 脚本的「使用 / 未使用」状态，按 产品/脚本 记录在数据目录的 _脚本状态.json
 	statusMu   sync.Mutex
 	statusPath string
@@ -58,6 +74,8 @@ func newApp(dataDir string) *App {
 		settings:     readSettings(settingsPath),
 		jobs:         make(map[string]*SplitJob),
 		rooms:        make(map[string]*Room),
+		mediaQueue:   make(map[string]*mediaCandidate),
+		searchCache:  make(map[string]searchCacheEntry),
 		statusPath:   statusPath,
 		status:       readStatus(statusPath),
 	}
@@ -84,6 +102,7 @@ func main() {
 	}
 
 	app := newApp(dataDir)
+	go app.runMediaCleaner() // 后台视频清理：把密集的编辑合并成偶尔一次全库核对
 	mux := http.NewServeMux()
 	app.routes(mux)
 
@@ -116,6 +135,7 @@ func main() {
 	go func() {
 		<-quit
 		app.flushAllRooms()
+		app.drainMediaQueue() // 退出前把队列里剩下的候选处理完，避免留到下次启动
 		os.Exit(0)
 	}()
 
@@ -144,6 +164,9 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/script", a.handleCreateScript)
 	mux.HandleFunc("POST /api/script/rename", a.handleRenameScript)
 	mux.HandleFunc("POST /api/script/delete", a.handleDeleteScript)
+	mux.HandleFunc("POST /api/product/delete", a.handleDeleteProduct)
+	mux.HandleFunc("GET /api/delete/precheck", a.handleDeletePrecheck)
+	mux.HandleFunc("POST /api/media/release-temp", a.handleReleaseTemp)
 	mux.HandleFunc("POST /api/usage", a.handleSetUsage)
 	mux.HandleFunc("GET /api/search", a.handleSearch)
 	mux.HandleFunc("GET /api/history", a.handleHistory)
@@ -162,6 +185,8 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/clip", a.handleClip)
 	mux.HandleFunc("POST /api/upload", a.handleUpload)
 	mux.HandleFunc("POST /api/temp", a.handleTempUpload)
+	mux.HandleFunc("GET /api/media/orphans", a.handleOrphanScan)
+	mux.HandleFunc("POST /api/media/orphans", a.handleOrphanDelete)
 	mux.HandleFunc("GET /api/collab", a.handleCollabState)
 	mux.HandleFunc("POST /api/collab", a.handleCollabMerge)
 	mux.HandleFunc("GET /api/collab/ws", a.handleCollabWS)

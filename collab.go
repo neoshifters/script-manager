@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,7 @@ const (
 	wsPingEvery    = 20 * time.Second
 	wsReadWindow   = 80 * time.Second
 	saveDebounce   = 500 * time.Millisecond
+	saveMaxDelay   = 5 * time.Second // 连续编辑时落盘最长推迟这么久，避免一直不写盘
 	maxWSFrame     = 4 << 20
 	maxRegsPerMsg  = 4000
 	maxRegKeyLen   = 200
@@ -90,12 +92,16 @@ type Room struct {
 	script  string
 	dir     string
 
-	mu        sync.Mutex
-	st        collabFile
-	clients   map[*wsClient]struct{}
-	saveTimer *time.Timer
-	savedAt   string
-	hist      []historyEntry
+	mu         sync.Mutex
+	st         collabFile
+	clients    map[*wsClient]struct{}
+	saveTimer  *time.Timer
+	savedAt    string
+	hist       []historyEntry
+	dead       bool      // 目录已被删除：任何迟到的保存都必须放弃，避免把目录写回来
+	dirty      bool      // 自上次落盘后是否有实际改动
+	dirtySince time.Time // 本轮改动开始的时间，用于限制连续编辑下的落盘延迟
+	rev        int64     // 状态版本号：内容或在线状态一变就加一，轮询兜底靠它跳过无变化的拉取
 }
 
 /* ---------------- 房间与持久化 ---------------- */
@@ -149,6 +155,7 @@ func (a *App) flushAllRooms() {
 }
 
 func (r *Room) load() {
+	r.dirty = true // 首次加载后至少落盘一次，保证三个文件都存在
 	docPath := filepath.Join(r.dir, docFileName)
 	collabPath := filepath.Join(r.dir, collabFileName)
 	r.hist = readHistoryFile(historyPath(r.dir))
@@ -233,6 +240,7 @@ func (r *Room) setLocked(key string, value any, t int64, site string) {
 		return
 	}
 	r.st.Regs[key] = reg
+	r.dirty = true
 }
 
 // importLocked 把一篇普通文档转成寄存器（用于首次导入与旧接口整体覆盖）。
@@ -409,21 +417,37 @@ func (r *Room) docNow() Doc {
 
 func (r *Room) scheduleSave() {
 	r.mu.Lock()
+	if r.dead {
+		r.mu.Unlock()
+		return
+	}
 	if r.saveTimer == nil {
 		r.saveTimer = time.AfterFunc(saveDebounce, r.saveNow)
-	} else {
-		r.saveTimer.Reset(saveDebounce)
+		r.dirtySince = time.Now()
+		r.mu.Unlock()
+		return
 	}
+	// 连续编辑会不断重置防抖；改动积压超过 saveMaxDelay 时立即落一次盘兜底。
+	overdue := !r.dirtySince.IsZero() && time.Since(r.dirtySince) >= saveMaxDelay
+	r.saveTimer.Reset(saveDebounce)
 	r.mu.Unlock()
+	if overdue {
+		go r.saveNow()
+	}
 }
 
-// saveNow 先写 文案.json（物化导出），再写 协同.json（权威状态）。
+// saveNow 先写 文案.json（物化导出），再写 协同.json（权威状态，紧凑编码）。
+// 没有实际改动时直接跳过，避免空转写盘。
 func (r *Room) saveNow() {
 	updated := time.Now().Format(time.RFC3339)
 	r.mu.Lock()
 	if r.saveTimer != nil {
 		r.saveTimer.Stop()
 		r.saveTimer = nil
+	}
+	if r.dead || !r.dirty {
+		r.mu.Unlock()
+		return
 	}
 	regs := make(map[string]Reg, len(r.st.Regs))
 	for k, v := range r.st.Regs {
@@ -434,15 +458,20 @@ func (r *Room) saveNow() {
 	st := collabFile{Version: 1, Epoch: r.st.Epoch, SavedAt: updated, Regs: regs}
 	hist := make([]historyEntry, len(r.hist))
 	copy(hist, r.hist)
+	r.dirty = false
+	r.dirtySince = time.Time{}
 	r.mu.Unlock()
 
 	if b, err := json.MarshalIndent(doc, "", "  "); err == nil {
 		_ = writeFileAtomic(filepath.Join(r.dir, docFileName), b)
 	}
-	if b, err := json.MarshalIndent(st, "", "  "); err == nil {
+	if b, err := json.Marshal(st); err == nil {
 		_ = writeFileAtomic(filepath.Join(r.dir, collabFileName), b)
 	}
 	_ = writeHistoryFile(historyPath(r.dir), hist)
+	if r.app != nil {
+		r.app.invalidateMediaIndex()
+	}
 }
 
 /* ---------------- 合并 ---------------- */
@@ -459,15 +488,18 @@ func validRegKey(key string) bool {
 	return true
 }
 
-// merge 把客户端上报的寄存器合并进房间，返回真正生效的部分。
+// merge 把客户端上报的寄存器合并进房间，返回真正生效的部分，
+// 以及这次改动里可能失去引用的视频路径候选（交给异步清理队列核对）。
 // 传入的 site 会覆盖寄存器里自带的编辑者标识，避免冒充别人。
-// 生效的改动会顺手记进修改历史（每批最多 maxHistoryBatch 条）。
-func (r *Room) merge(site, name string, regs map[string]Reg) map[string]Reg {
+// 生效的改动会顺手记进修改历史（每批最多 maxHistoryBatch 条；同一字段
+// 短时间内的连续输入会合并成一条，避免刷屏）。
+func (r *Room) merge(site, name string, regs map[string]Reg) (map[string]Reg, []string) {
 	changed := make(map[string]Reg)
 	if site == "" || len(regs) == 0 {
-		return changed
+		return changed, nil
 	}
 	var deltas []regDelta
+	var lostRefs []string // 可能失去引用的视频路径，最终以全库引用计数为准
 	r.mu.Lock()
 	n := 0
 	for key, reg := range regs {
@@ -484,7 +516,14 @@ func (r *Room) merge(site, name string, regs map[string]Reg) map[string]Reg {
 			continue
 		}
 		r.st.Regs[key] = reg
+		r.dirty = true
+		r.rev++
 		changed[key] = reg
+		if existed {
+			if p := r.oldMediaPathLocked(key, old); p != "" {
+				lostRefs = append(lostRefs, p)
+			}
+		}
 		if len(deltas) < maxHistoryBatch {
 			d := regDelta{key: key, after: reg}
 			if existed {
@@ -494,23 +533,71 @@ func (r *Room) merge(site, name string, regs map[string]Reg) map[string]Reg {
 			deltas = append(deltas, d)
 		}
 	}
+	// 整行打上墓碑：video 寄存器本身没动，也算失去一处引用。
+	for key, reg := range changed {
+		parts := strings.SplitN(key, "|", 3)
+		if len(parts) != 3 || parts[0] != "s" || parts[2] != "dead" {
+			continue
+		}
+		var dead bool
+		if json.Unmarshal(reg.V, &dead) != nil || !dead {
+			continue
+		}
+		if vreg, ok := r.st.Regs["s|"+parts[1]+"|video"]; ok {
+			if p := r.videoRegPathLocked(vreg); p != "" {
+				lostRefs = append(lostRefs, p)
+			}
+		}
+	}
 	if len(deltas) > 0 {
 		by := name
 		if by == "" {
 			by = "同事"
 		}
-		r.hist = trimHistory(append(r.hist, r.buildHistoryLocked(deltas, by)...))
+		r.hist = appendHistoryEntries(r.hist, r.buildHistoryLocked(deltas, by))
 	}
 	r.mu.Unlock()
 	if len(changed) > 0 {
 		r.scheduleSave()
 	}
-	return changed
+	return changed, lostRefs
+}
+
+// oldMediaPathLocked 从被覆盖寄存器的旧值里取出视频路径；只关心 s|<id>|video 与 e|source。
+func (r *Room) oldMediaPathLocked(key string, old Reg) string {
+	if old.V == nil {
+		return ""
+	}
+	if key == "e|source" {
+		var src string
+		if json.Unmarshal(old.V, &src) != nil || strings.TrimSpace(src) == "" {
+			return ""
+		}
+		return r.app.safeTempFile(src)
+	}
+	parts := strings.SplitN(key, "|", 3)
+	if len(parts) != 3 || parts[0] != "s" || parts[2] != "video" {
+		return ""
+	}
+	return r.videoRegPathLocked(old)
+}
+
+func (r *Room) videoRegPathLocked(reg Reg) string {
+	if reg.V == nil || r.app == nil {
+		return ""
+	}
+	var ref VideoRef
+	if json.Unmarshal(reg.V, &ref) != nil || ref.File == "" {
+		return ""
+	}
+	return r.app.videoRefPath(r.dir, &ref)
 }
 
 // replaceWithDoc 供旧的整体保存接口使用：整篇覆盖后通知在线客户端重新拉取。
 func (r *Room) replaceWithDoc(doc Doc) {
 	r.mu.Lock()
+	r.dirty = true
+	r.rev++
 	for k := range r.st.Regs {
 		if strings.HasPrefix(k, "s|") || strings.HasPrefix(k, "e|") {
 			delete(r.st.Regs, k)
@@ -546,6 +633,7 @@ func (r *Room) peers() []peerInfo {
 func (r *Room) addClient(c *wsClient) {
 	r.mu.Lock()
 	r.clients[c] = struct{}{}
+	r.rev++
 	st, doc, peers, savedAt := r.snapshotLocked()
 	r.mu.Unlock()
 
@@ -560,6 +648,9 @@ func (r *Room) removeClient(c *wsClient) {
 	r.mu.Lock()
 	_, ok := r.clients[c]
 	delete(r.clients, c)
+	if ok {
+		r.rev++
+	}
 	r.mu.Unlock()
 	if ok {
 		r.broadcast(nil, map[string]any{"t": "peers", "peers": r.peers()})
@@ -574,6 +665,7 @@ func (r *Room) setPresence(c *wsClient, cell string) {
 	changed := c.cell != cell
 	if changed {
 		c.cell = cell
+		r.rev++
 	}
 	r.mu.Unlock()
 	if changed {
@@ -584,6 +676,7 @@ func (r *Room) setPresence(c *wsClient, cell string) {
 func (r *Room) renameClient(c *wsClient, name string) {
 	r.mu.Lock()
 	c.name = name
+	r.rev++
 	r.mu.Unlock()
 	r.broadcast(nil, map[string]any{"t": "peers", "peers": r.peers()})
 }
@@ -631,6 +724,30 @@ func (a *App) evictRoom(dir string, notice any) {
 		return
 	}
 	room.saveNow()
+	if notice != nil {
+		room.broadcast(nil, notice)
+	}
+	room.closeClients()
+}
+
+// forgetRoom 在目录已经删除后移除房间：不再 saveNow（否则会把目录写回来），
+// 只广播提示并断开在线客户端。
+func (a *App) forgetRoom(dir string, notice any) {
+	a.hubMu.Lock()
+	room := a.rooms[dir]
+	delete(a.rooms, dir)
+	a.hubMu.Unlock()
+	if room == nil {
+		return
+	}
+	// 标记房间作废并停掉防抖保存：目录已经删了，迟到的定时器不能再把文件夹写回来
+	room.mu.Lock()
+	room.dead = true
+	if room.saveTimer != nil {
+		room.saveTimer.Stop()
+		room.saveTimer = nil
+	}
+	room.mu.Unlock()
 	if notice != nil {
 		room.broadcast(nil, notice)
 	}
@@ -940,11 +1057,14 @@ func (a *App) handleCollabWS(w http.ResponseWriter, r *http.Request) {
 		}
 		switch msg.T {
 		case "merge":
-			changed := room.merge(site, c.name, msg.Regs)
+			changed, lost := room.merge(site, c.name, msg.Regs)
 			if len(changed) > 0 {
 				room.broadcast(c, map[string]any{"t": "merge", "from": site, "regs": changed})
 			}
 			c.sendJSON(map[string]any{"t": "ack", "now": time.Now().UnixMilli(), "savedAt": room.savedAtValue()})
+			if len(lost) > 0 {
+				a.enqueueMediaCleanup(room.dir, lost, c.name)
+			}
 		case "presence":
 			room.setPresence(c, msg.Cell)
 		case "rename":
@@ -963,6 +1083,13 @@ func (r *Room) savedAtValue() string {
 	return r.savedAt
 }
 
+// revValue 返回当前状态版本号。轮询客户端带上自己手里的版本，服务端没变就只回一个 noop。
+func (r *Room) revValue() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rev
+}
+
 /* ---------------- HTTP 接口（轮询兜底 / 首次加载） ---------------- */
 
 func (a *App) handleCollabState(w http.ResponseWriter, r *http.Request) {
@@ -971,9 +1098,20 @@ func (a *App) handleCollabState(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, err.Error())
 		return
 	}
+	// 轮询增量：客户端带上手里的版本号，没变化就只回一个 noop，省掉全量投影和传输。
+	if since := strings.TrimSpace(r.URL.Query().Get("rev")); since != "" {
+		if cur := room.revValue(); strconv.FormatInt(cur, 10) == since {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"noop": true, "rev": cur, "now": time.Now().UnixMilli(),
+			})
+			return
+		}
+	}
+	rev := room.revValue() // 取快照前的版本：宁可多发一次全量，也不能漏
 	st, doc, peers, savedAt := room.snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"epoch":   st.Epoch,
+		"rev":     rev,
 		"now":     time.Now().UnixMilli(),
 		"savedAt": savedAt,
 		"regs":    st.Regs,
@@ -1006,12 +1144,17 @@ func (a *App) handleCollabMerge(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "缺少协作标识")
 		return
 	}
-	changed := room.merge(site, cleanLabel(req.Name), req.Regs)
+	changed, lost := room.merge(site, cleanLabel(req.Name), req.Regs)
+	if len(lost) > 0 {
+		a.enqueueMediaCleanup(room.dir, lost, cleanLabel(req.Name))
+	}
+	rev := room.revValue()
 	st, doc, peers, savedAt := room.snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"changed": len(changed),
 		"regs":    changed,
 		"epoch":   st.Epoch,
+		"rev":     rev,
 		"now":     time.Now().UnixMilli(),
 		"doc":     doc,
 		"peers":   peers,

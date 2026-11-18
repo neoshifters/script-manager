@@ -20,11 +20,6 @@ _脚本状态.json
 .env
 .env.*
 
-# 仅供内部环境的文档，未纳入公开仓库
-飞牛NAS-Docker安装指南.md
-Docker更新方法.md
-远程访问指南.md
-
 # 系统与编辑器
 .DS_Store
 Thumbs.db

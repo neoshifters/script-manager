@@ -363,10 +363,13 @@ func (a *App) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	doc.UpdatedAt = time.Now().Format(time.RFC3339)
 	// 已经有人在线协作时，整体保存按「导入」处理并通知在线客户端重新拉取
 	if room := a.existingRoom(dir); room != nil {
+		before := room.docNow()
 		room.replaceWithDoc(doc)
+		a.cleanupMediaAfterChange(dir, room, before, doc, "整体保存")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updatedAt": doc.UpdatedAt})
 		return
 	}
+	old, _ := readDoc(filepath.Join(dir, docFileName), product, script)
 	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		fail(w, http.StatusBadRequest, "文案数据无法序列化")
@@ -376,6 +379,8 @@ func (a *App) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "保存失败: "+err.Error())
 		return
 	}
+	a.invalidateMediaIndex()
+	a.cleanupMediaAfterChange(dir, nil, old, doc, "整体保存")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updatedAt": doc.UpdatedAt})
 }
 
@@ -598,6 +603,23 @@ func (a *App) renameStatus(product, oldName, newName string) {
 	_ = a.saveStatusLocked()
 }
 
+// dropProductStatus 删除产品后清掉该产品下所有脚本的使用状态。
+func (a *App) dropProductStatus(product string) {
+	a.statusMu.Lock()
+	defer a.statusMu.Unlock()
+	prefix := product + "/"
+	changed := false
+	for key := range a.status.Scripts {
+		if strings.HasPrefix(key, prefix) {
+			delete(a.status.Scripts, key)
+			changed = true
+		}
+	}
+	if changed {
+		_ = a.saveStatusLocked()
+	}
+}
+
 func (a *App) dropStatus(product, script string) {
 	a.statusMu.Lock()
 	defer a.statusMu.Unlock()
@@ -703,25 +725,54 @@ func (a *App) handleDeleteScript(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Product string `json:"product"`
 		Script  string `json:"script"`
+		Name    string `json:"name"`
 	}
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	dir, err := a.scriptDir(req.Product, req.Script, true)
-	if err != nil {
+	if _, err := a.scriptDir(req.Product, req.Script, true); err != nil {
 		fail(w, http.StatusNotFound, err.Error())
 		return
 	}
 	product, _ := sanitizeName(req.Product)
 	script, _ := sanitizeName(req.Script)
-	a.evictRoom(dir, map[string]any{"t": "gone", "product": product, "script": script})
-	if err := os.RemoveAll(dir); err != nil {
-		fail(w, http.StatusInternalServerError, "删除失败: "+err.Error())
+	by := cleanLabel(req.Name)
+	if by == "" {
+		by = "同事"
+	}
+	res, err := a.deleteScopeDir(product, script, by)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	a.dropStatus(product, script)
 	a.broadcastAll(map[string]any{"t": "tree"})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (a *App) handleDeleteProduct(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Product string `json:"product"`
+		Name    string `json:"name"`
+	}
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	product, err := sanitizeName(req.Product)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "产品名无效: "+err.Error())
+		return
+	}
+	by := cleanLabel(req.Name)
+	if by == "" {
+		by = "同事"
+	}
+	res, err := a.deleteScopeDir(product, "", by)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	a.broadcastAll(map[string]any{"t": "tree"})
+	writeJSON(w, http.StatusOK, res)
 }
 
 /* ---------------- 全文检索（镜头内容 / 口播 / 文案） ---------------- */
@@ -769,6 +820,36 @@ func (a *App) docForSearch(dir, product, script string) (Doc, error) {
 	return readDoc(filepath.Join(dir, docFileName), product, script)
 }
 
+// 搜索结果短缓存：搜索框连续输入会高频触发全库扫描，
+// 同一关键词在 searchCacheTTL 内直接复用上一次结果。
+const searchCacheTTL = 3 * time.Second
+
+type searchCacheEntry struct {
+	at        time.Time
+	items     []searchHit
+	truncated bool
+}
+
+func (a *App) cachedSearch(key string) (searchCacheEntry, bool) {
+	a.searchMu.Lock()
+	defer a.searchMu.Unlock()
+	e, ok := a.searchCache[key]
+	if !ok || time.Since(e.at) >= searchCacheTTL {
+		delete(a.searchCache, key)
+		return searchCacheEntry{}, false
+	}
+	return e, true
+}
+
+func (a *App) putCachedSearch(key string, items []searchHit, truncated bool) {
+	a.searchMu.Lock()
+	if len(a.searchCache) > 128 {
+		a.searchCache = make(map[string]searchCacheEntry)
+	}
+	a.searchCache[key] = searchCacheEntry{at: time.Now(), items: items, truncated: truncated}
+	a.searchMu.Unlock()
+}
+
 func (a *App) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" || len([]rune(q)) > 60 {
@@ -786,8 +867,14 @@ func (a *App) handleSearch(w http.ResponseWriter, r *http.Request) {
 			onlyProduct = ""
 		}
 	}
+	cacheKey := strings.ToLower(q) + "|" + onlyProduct
+	if e, ok := a.cachedSearch(cacheKey); ok {
+		writeJSON(w, http.StatusOK, map[string]any{"q": q, "items": e.items, "truncated": e.truncated})
+		return
+	}
 	maxPerScript := 5
 	maxTotal := 80
+	lowerQ := strings.ToLower(q)
 	hits := make([]searchHit, 0, 16)
 	truncated := false
 
@@ -821,26 +908,26 @@ func (a *App) handleSearch(w http.ResponseWriter, r *http.Request) {
 			}
 			count := 0
 			for _, shot := range doc.Shots {
-				fields := []struct{ name, text string }{
-					{"content", shot.Content},
-					{"narration", shot.Narration},
-					{"copy", shot.Copy},
+				var field, text string
+				switch {
+				case strings.Contains(strings.ToLower(shot.Content), lowerQ):
+					field, text = "content", shot.Content
+				case strings.Contains(strings.ToLower(shot.Narration), lowerQ):
+					field, text = "narration", shot.Narration
+				case strings.Contains(strings.ToLower(shot.Copy), lowerQ):
+					field, text = "copy", shot.Copy
+				default:
+					continue // 同一镜头命中多个字段时只报一条，避免刷屏
 				}
-				for _, f := range fields {
-					if f.text == "" || !strings.Contains(strings.ToLower(f.text), strings.ToLower(q)) {
-						continue
-					}
-					hits = append(hits, searchHit{
-						Product: entry.Name(),
-						Script:  s.Name(),
-						ShotID:  shot.ID,
-						No:      shot.No,
-						Field:   f.name,
-						Snippet: snippetAround(f.text, q),
-					})
-					count++
-					break // 同一镜头命中多个字段时只报一条，避免刷屏
-				}
+				hits = append(hits, searchHit{
+					Product: entry.Name(),
+					Script:  s.Name(),
+					ShotID:  shot.ID,
+					No:      shot.No,
+					Field:   field,
+					Snippet: snippetAround(text, q),
+				})
+				count++
 				if count >= maxPerScript {
 					break
 				}
@@ -854,5 +941,6 @@ func (a *App) handleSearch(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	a.putCachedSearch(cacheKey, hits, truncated)
 	writeJSON(w, http.StatusOK, map[string]any{"q": q, "items": hits, "truncated": truncated})
 }

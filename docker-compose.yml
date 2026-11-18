@@ -15,6 +15,6 @@ services:
       SM_DRAFT_ROOT: "/drafts/JianyingPro Drafts"
     volumes:
       # 数据目录：改成宿主机上的绝对路径，或通过同目录 .env 设置 SCRIPT_DATA_DIR
-      - "${SCRIPT_DATA_DIR:-./data}:/data"
+      - "/vol2/路径/脚本管理:/data"
       # 剪映草稿根目录（可选）：改成宿主机上的草稿目录，或设置 JIANYING_DRAFT_DIR
       - "${JIANYING_DRAFT_DIR:-./drafts}:/drafts"

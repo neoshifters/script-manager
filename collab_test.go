@@ -48,11 +48,11 @@ func TestStageThreeMergeRules(t *testing.T) {
 	}
 
 	// 不同列并发写入，都能保留
-	changed := room.merge("A", "同事", map[string]Reg{contentKey: reg(1000, "A 的内容")})
+	changed, _ := room.merge("A", "同事", map[string]Reg{contentKey: reg(1000, "A 的内容")})
 	if len(changed) != 1 {
 		t.Fatalf("A merge changed=%d", len(changed))
 	}
-	changed = room.merge("B", "同事", map[string]Reg{narrationKey: reg(1000, "B 的口播")})
+	changed, _ = room.merge("B", "同事", map[string]Reg{narrationKey: reg(1000, "B 的口播")})
 	if len(changed) != 1 {
 		t.Fatalf("B merge changed=%d", len(changed))
 	}
@@ -62,7 +62,7 @@ func TestStageThreeMergeRules(t *testing.T) {
 	}
 
 	// 旧版本不会覆盖新版本
-	changed = room.merge("A", "同事", map[string]Reg{contentKey: reg(900, "过期内容")})
+	changed, _ = room.merge("A", "同事", map[string]Reg{contentKey: reg(900, "过期内容")})
 	if len(changed) != 0 {
 		t.Fatalf("旧版本不应生效: %+v", changed)
 	}
@@ -82,7 +82,7 @@ func TestStageThreeMergeRules(t *testing.T) {
 		"":                     reg(9999, "x"),
 		"s|" + id + "|content": {T: 0, S: "A", V: json.RawMessage(`"x"`)},
 	}
-	if c := room.merge("A", "同事", bad); len(c) != 0 {
+	if c, _ := room.merge("A", "同事", bad); len(c) != 0 {
 		t.Fatalf("非法寄存器不应生效: %+v", c)
 	}
 

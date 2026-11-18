@@ -251,6 +251,8 @@
     var cell = '';
     var epoch = opts.epoch || '';
     var queue = {};
+    var flushTimer = 0;
+    var pollRev = '';
 
     function q() {
       return 'product=' + encodeURIComponent(product) + '&script=' + encodeURIComponent(script);
@@ -282,10 +284,30 @@
       }
     }
 
+    /* 发送窗口：连打键盘时同一字段每 120ms 最多合并上报一次，
+       避免每敲一键一个 WS 帧 / 一个 POST。 */
+    function scheduleFlush() {
+      if (flushTimer) return;
+      flushTimer = setTimeout(function () {
+        flushTimer = 0;
+        if (polling) drainPollQueue();
+        else flushQueue();
+      }, 120);
+    }
+
     function flushQueue() {
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = 0; }
       var keys = Object.keys(queue);
       if (!keys.length) return;
       if (send({ t: 'merge', regs: queue })) queue = {};
+    }
+
+    function drainPollQueue() {
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = 0; }
+      if (!Object.keys(queue).length) return;
+      var payload = queue;
+      queue = {};
+      postMerge(payload);
     }
 
     function postMerge(regs) {
@@ -297,6 +319,7 @@
       })
         .then(function (r) { return r.json(); })
         .then(function (data) {
+          if (data && data.rev != null) pollRev = String(data.rev);
           if (data && data.epoch && opts.onSnapshot) {
             opts.onSnapshot({ epoch: data.epoch, now: data.now, regs: data.regs || {}, peers: data.peers || [], savedAt: data.savedAt });
           }
@@ -308,13 +331,7 @@
     function push(regs) {
       Object.assign(queue, regs);
       cacheLocal();
-      if (polling) {
-        var payload = queue;
-        queue = {};
-        postMerge(payload);
-        return;
-      }
-      flushQueue();
+      scheduleFlush();
     }
 
     function mineRegs() {
@@ -344,11 +361,18 @@
     function startPolling() {
       if (polling || closed) return;
       polling = true;
+      pollRev = '';
       setStatus('polling');
       var tick = function () {
         if (closed) return;
-        getJSON('/api/collab?' + q() + '&site=' + encodeURIComponent(site) + '&name=' + encodeURIComponent(myName))
-          .then(applySnapshot)
+        var url = '/api/collab?' + q() + '&site=' + encodeURIComponent(site) + '&name=' + encodeURIComponent(myName);
+        if (pollRev) url += '&rev=' + encodeURIComponent(pollRev);
+        getJSON(url)
+          .then(function (data) {
+            if (!data || data.noop) return; // 服务端说没变化，跳过全量合并
+            if (data.rev != null) pollRev = String(data.rev);
+            applySnapshot(data);
+          })
           .catch(function () {});
         if (Object.keys(queue).length) {
           var payload = queue;
@@ -452,12 +476,8 @@
     }
 
     function flushNow() {
-      if (status === 'online') flushQueue();
-      else if (polling && Object.keys(queue).length) {
-        var payload = queue;
-        queue = {};
-        postMerge(payload);
-      }
+      if (polling) drainPollQueue();
+      else flushQueue();
       persist();
     }
 
@@ -467,6 +487,8 @@
       clearInterval(pollTimer);
       clearInterval(presenceTimer);
       clearTimeout(cacheTimer);
+      clearTimeout(flushTimer);
+      flushTimer = 0;
       persist();
       if (ws) {
         try { ws.close(); } catch (_) {}

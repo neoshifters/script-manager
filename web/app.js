@@ -334,6 +334,7 @@ const crumbProduct = $('#crumbProduct');
 const shotCount = $('#shotCount');
 const addScriptBtn = $('#addScript');
 const addProductBtn = $('#addProduct');
+const delProductBtn = $('#delProduct');
 const crumbSep = $('.crumb-sep');
 
 const clipDrop = $('#clipDrop');
@@ -449,6 +450,16 @@ const exportCopy = $('#exportCopy');
 const setDraftRoot = $('#setDraftRoot');
 const setNasPrefix = $('#setNasPrefix');
 const setWinPrefix = $('#setWinPrefix');
+const orphanModal = $('#orphanModal');
+const orphanOpen = $('#orphanOpen');
+const orphanClose = $('#orphanClose');
+const orphanSummary = $('#orphanSummary');
+const orphanAll = $('#orphanAll');
+const orphanSelected = $('#orphanSelected');
+const orphanList = $('#orphanList');
+const orphanNote = $('#orphanNote');
+const orphanRescan = $('#orphanRescan');
+const orphanDelete = $('#orphanDelete');
 
 /* 手机端：列表 / 镜头视图切换与「更多」菜单 */
 const workspaceEl = $('.workspace');
@@ -1087,6 +1098,13 @@ function bindMobile() {
     openMobileMenu(false);
     setClipPanel(true, false);
   });
+  const mDelProduct = $('#mDelProduct');
+  if (mDelProduct) {
+    mDelProduct.addEventListener('click', () => {
+      openMobileMenu(false);
+      askDeleteProduct();
+    });
+  }
   $('#mHistory').addEventListener('click', () => {
     openMobileMenu(false);
     historyBtn.click();
@@ -1210,6 +1228,7 @@ async function init() {
   bindColumnResize();
   bindHistory();
   bindExport();
+  bindOrphans();
   bindGlobal();
   bindPanel();
   bindSettings();
@@ -1249,6 +1268,8 @@ async function refreshListOnly() {
 
 let pendingMove = '';
 let pendingDelete = '';
+let pendingProduct = '';
+let pendingClipReplace = null;
 
 async function handleScriptMoved(msg) {
   if (pendingMove === msg.from) return;
@@ -1266,7 +1287,11 @@ async function handleScriptMoved(msg) {
 
 async function handleScriptGone(msg) {
   if (pendingDelete === msg.script) return;
+  if (pendingProduct && pendingProduct === msg.product) return;
   await refreshListOnly();
+  // 整个产品被删时会连续收到多条 gone：产品已经不在列表里就安静跳过，避免刷屏
+  const productGone = !state.products.some((p) => p.name === msg.product);
+  if (productGone && state.product !== msg.product) return;
   if (msg.product === state.product && msg.script === state.script) {
     toast('「' + msg.script + '」已被删除', 3600);
     stopSession();
@@ -1355,6 +1380,7 @@ async function selectScriptOf(product, name) {
 
 async function loadDocFor(product, script) {
   const seq = ++loadSeq;
+  pendingClipReplace = null;
   stopSession();
   setSaveStatus('加载中…', '');
   try {
@@ -1533,7 +1559,7 @@ function startSession(seq, product, script) {
       if (!state.regs) return;
       const changed = Collab.mergeRegs(state.regs, regs);
       if (!Object.keys(changed).length) return;
-      patchDoc(normalizeDoc(Collab.project(state.regs, state.product, state.script), state.product, state.script), changed);
+      patchRemote(changed);
     },
     onPeers: (peers) => renderPeers(peers),
     onTree: () => refreshListOnly(),
@@ -1651,7 +1677,7 @@ function bindCollab() {
   });
   /* 轮询模式下没有 tree 广播，回到页面时补一次列表刷新 */
   window.addEventListener('focus', () => {
-    if (pendingMove || pendingDelete) return;
+    if (pendingMove || pendingDelete || pendingProduct) return;
     if (Date.now() - treeFetchedAt > 4000) refreshListOnly();
   });
 }
@@ -1666,14 +1692,90 @@ function patchDoc(next, changed) {
   }
   const prevIds = prev.shots.map((s) => s.id).join(',');
   const nextIds = next.shots.map((s) => s.id).join(',');
-  renderEditor();
-  if (prevIds !== nextIds) {
+  const structural = prevIds !== nextIds;
+  const hasEdit = changed && Object.keys(changed).some((k) => k.indexOf('e|') === 0);
+  if (structural || hasEdit) renderEditor();
+  if (structural) {
     rerenderTable();
   } else {
     updateCells(prev, next);
   }
   applyRemoteEdit(prev, next, changed);
   paintPresence();
+}
+
+/* 增量远端合并：只是已有行的普通字段变化时，定点更新那几行，
+   不做整篇投影、不重建表格；出现新行 / 删除 / 排序等结构变化才回退全量路径。 */
+function patchRemote(changed) {
+  if (!state.doc || !state.regs) return;
+  const keys = Object.keys(changed || {});
+  if (!keys.length) return;
+  const FIELD_OK = { no: 1, content: 1, narration: 1, copy: 1, video: 1 };
+  const byId = new Map(state.doc.shots.map((s) => [s.id, s]));
+  const touched = new Map();
+  let structural = false;
+  let editDirty = false;
+  for (const key of keys) {
+    if (key.indexOf('e|') === 0) {
+      editDirty = true;
+      continue;
+    }
+    const p = key.split('|');
+    if (p.length !== 3 || p[0] !== 's' || !FIELD_OK[p[2]] || !byId.has(p[1])) {
+      structural = true;
+      break;
+    }
+    if (!touched.has(p[1])) touched.set(p[1], {});
+    touched.get(p[1])[p[2]] = true;
+  }
+  const project = () => normalizeDoc(Collab.project(state.regs, state.product, state.script), state.product, state.script);
+  if (structural) {
+    patchDoc(project(), changed);
+    return;
+  }
+  touched.forEach((fields, id) => {
+    const shot = byId.get(id);
+    Object.keys(fields).forEach((f) => {
+      const reg = changed[Collab.shotKey(id, f)];
+      const v = reg ? reg.v : undefined;
+      if (f === 'video') {
+        shot.video = v && v.file
+          ? { src: v.src === 'temp' ? 'temp' : 'script', file: String(v.file), label: v.label || '', in: Number(v.in) || 0, out: Number(v.out) || 0 }
+          : null;
+      } else if (f === 'no') {
+        shot.no = String(v == null ? '' : v);
+      } else {
+        shot[f] = v == null ? '' : String(v);
+      }
+    });
+    syncShotRow(shot, fields);
+  });
+  if (editDirty) {
+    const prev = state.doc;
+    const next = project();
+    state.doc = next;
+    renderEditor();
+    applyRemoteEdit(prev, next, changed);
+  }
+}
+
+/* 定点刷新受影响的一行：输入框只在未聚焦且值不同才写入，视频卡片按需重画 */
+function syncShotRow(shot, fields) {
+  const row = rowsEl.querySelector(`.row[data-id="${shot.id}"]`);
+  if (!row) return;
+  ['no', 'content', 'narration', 'copy'].forEach((field) => {
+    if (!fields[field]) return;
+    const input = row.querySelector(`[data-field="${field}"]`);
+    if (!input || input === document.activeElement) return;
+    if (input.value !== shot[field]) {
+      input.value = shot[field];
+      if (input.tagName === 'TEXTAREA') autoGrow(input);
+    }
+  });
+  if (fields.video) {
+    const cell = row.querySelector('.video-cell');
+    if (cell && cell._drawVideo) cell._drawVideo();
+  }
 }
 
 function updateCells(prev, next) {
@@ -2008,38 +2110,54 @@ async function toggleUsage(entry, used) {
   }
 }
 
-/* ---- 删除脚本：第一次点击变成确认态，几秒后自动复原 ---- */
-function askDeleteScript(row, btn, entry) {
-  if (!row.classList.contains('confirming')) {
-    row.classList.add('confirming');
-    btn.textContent = '确认删除';
-    btn.classList.add('confirm');
-    let timer = 0;
-    const reset = () => {
-      clearTimeout(timer);
-      row.classList.remove('confirming');
-      btn.textContent = '删除';
-      btn.classList.remove('confirm');
-      row._resetDelete = null;
-    };
-    timer = setTimeout(reset, 3500);
-    row._resetDelete = reset;
-    return;
+/* ---- 删除脚本：弹二次确认，说明会连同文件夹与视频一起删除 ---- */
+async function askDeleteScript(row, btn, entry) {
+  let pre = null;
+  try {
+    pre = await api(
+      '/api/delete/precheck?type=script&product=' +
+        encodeURIComponent(entry.product) +
+        '&script=' +
+        encodeURIComponent(entry.name)
+    );
+  } catch (_) {
+    pre = null;
   }
-  if (row._resetDelete) row._resetDelete();
-  deleteScript(entry);
+  openConfirm({
+    title: '删除脚本「' + entry.name + '」？',
+    desc: buildDeleteDesc('script', pre),
+    confirmText: '确认删除',
+    onConfirm: () => deleteScript(entry),
+  });
+}
+
+function buildDeleteDesc(kind, pre) {
+  const lines = [];
+  if (kind === 'product') {
+    lines.push('会同时删除该产品文件夹及其中的全部脚本、视频文件，不可恢复。');
+  } else {
+    lines.push('会同时删除该脚本文件夹及其中的视频文件，不可恢复。');
+  }
+  if (pre) {
+    lines.push('将删除 ' + pre.files + ' 个文件，合计 ' + humanSize(pre.size) + '（其中视频 ' + pre.videos + ' 个）。');
+    lines.push('目录：' + pre.path);
+  } else {
+    lines.push('文件数量与大小暂时无法统计，请确认下方目录后再删除。');
+  }
+  lines.push('仍被其他脚本或剪辑素材引用的视频会保留；剪映草稿目录不会被动到。');
+  return lines.join('\n');
 }
 
 async function deleteScript(entry) {
   const current = entry.product === state.product && entry.name === state.script;
   pendingDelete = entry.name;
   try {
-    await api('/api/script/delete', {
+    const res = await api('/api/script/delete', {
       method: 'POST',
-      body: { product: entry.product, script: entry.name },
+      body: { product: entry.product, script: entry.name, name: me && me.name },
     });
     state.used.delete(scriptKey(entry.product, entry.name));
-    toast('已删除脚本「' + entry.name + '」');
+    toast(res.message || '已删除脚本「' + entry.name + '」', 4200);
     if (current) {
       stopSession();
       state.script = '';
@@ -2049,10 +2167,49 @@ async function deleteScript(entry) {
       await loadTree();
       renderScriptList();
     }
+  } finally {
     pendingDelete = '';
-  } catch (err) {
-    pendingDelete = '';
-    toast(err.message, 4200);
+  }
+}
+
+async function askDeleteProduct() {
+  const name = state.product;
+  if (!name) {
+    toast('请先选择产品', 2600);
+    return;
+  }
+  let pre = null;
+  try {
+    pre = await api('/api/delete/precheck?type=product&product=' + encodeURIComponent(name));
+  } catch (_) {
+    pre = null;
+  }
+  openConfirm({
+    title: '删除产品「' + name + '」？',
+    desc: buildDeleteDesc('product', pre),
+    confirmText: '确认删除',
+    onConfirm: () => deleteProduct(name),
+  });
+}
+
+async function deleteProduct(name) {
+  pendingProduct = name;
+  try {
+    const res = await api('/api/product/delete', {
+      method: 'POST',
+      body: { product: name, name: me && me.name },
+    });
+    state.used = new Set(Array.from(state.used).filter((key) => key.indexOf(name + '/') !== 0));
+    if (state.product === name) {
+      stopSession();
+      state.product = '';
+      state.script = '';
+      state.doc = null;
+    }
+    await refreshAll();
+    toast(res.message || '已删除产品「' + name + '」', 4200);
+  } finally {
+    pendingProduct = '';
   }
 }
 
@@ -2427,19 +2584,78 @@ function renderTable() {
     return;
   }
   pruneSelection();
-  state.doc.shots.forEach((shot) => rowsEl.appendChild(buildRow(shot)));
+  rowsEl.classList.toggle('virtualized', state.doc.shots.length > 150);
+  const created = renderRowsDiff(state.doc.shots);
   renderBatchBar();
   syncSelectAll();
   requestAnimationFrame(() => {
-    $$('.cell-input', rowsEl).forEach(autoGrow);
-    $$('.no-input', rowsEl).forEach(fitNoInput);
+    created.forEach((row) => {
+      $$('.cell-input', row).forEach(autoGrow);
+      $$('.no-input', row).forEach(fitNoInput);
+    });
     paintPresence();
   });
+}
+
+/* 行级 diff：id 相同的行复用原 DOM 只更新值，增减的行单独处理，顺序按 shots 对齐。
+   rowsEl 为空时（首次加载 / 切换脚本）自然退化为全量构建。 */
+function renderRowsDiff(shots) {
+  const nextIds = new Set();
+  shots.forEach((s) => nextIds.add(s.id));
+  const existing = new Map();
+  Array.from(rowsEl.children).forEach((node) => {
+    if (node.dataset && node.dataset.id && nextIds.has(node.dataset.id)) existing.set(node.dataset.id, node);
+    else node.remove();
+  });
+  const created = [];
+  let anchor = null;
+  shots.forEach((shot) => {
+    let row = existing.get(shot.id);
+    if (row) {
+      refreshRowValues(row, shot);
+    } else {
+      row = buildRow(shot);
+      created.push(row);
+    }
+    const wanted = anchor ? anchor.nextSibling : rowsEl.firstChild;
+    if (row !== wanted) rowsEl.insertBefore(row, wanted);
+    anchor = row;
+  });
+  return created;
+}
+
+/* 把行闭包引用的旧 shot 对象就地更新，再按需刷新行内控件 */
+function refreshRowValues(row, shot) {
+  const cur = row._shot || shot;
+  ['no', 'content', 'narration', 'copy'].forEach((f) => { cur[f] = shot[f]; });
+  const videoChanged = JSON.stringify(cur.video || null) !== JSON.stringify(shot.video || null);
+  if (videoChanged) cur.video = shot.video;
+  const box = row.querySelector('.pick-box');
+  if (box) {
+    box.checked = selection.has(shot.id);
+    row.classList.toggle('selected', box.checked);
+    box.setAttribute('aria-label', '选择镜头 ' + shot.no);
+  }
+  const del = row.querySelector('.shot-del');
+  if (del) del.setAttribute('aria-label', '删除镜头 ' + shot.no);
+  ['no', 'content', 'narration', 'copy'].forEach((field) => {
+    const input = row.querySelector(`[data-field="${field}"]`);
+    if (!input || input === document.activeElement) return;
+    if (input.value !== cur[field]) {
+      input.value = cur[field];
+      if (input.tagName === 'TEXTAREA') autoGrow(input);
+    }
+  });
+  if (videoChanged) {
+    const cell = row.querySelector('.video-cell');
+    if (cell && cell._drawVideo) cell._drawVideo();
+  }
 }
 
 function buildRow(shot) {
   const row = el('div', 'row');
   row.dataset.id = shot.id;
+  row._shot = shot;
 
   const pickCell = el('div', 'cell pick-cell');
   const box = el('input', 'pick-box');
@@ -2546,6 +2762,35 @@ function buildVideoCell(shot) {
   return cell;
 }
 
+/* 视频懒加载：只有快滚进视口的卡片才真正发起 metadata 请求，
+   几百行时打开脚本不会再出现 Range 请求风暴。 */
+let videoLazyIO = null;
+
+function loadLazyVideo(videoEl) {
+  const src = videoEl.dataset.src;
+  if (!src || videoEl.src) return;
+  delete videoEl.dataset.src;
+  videoEl.preload = 'metadata';
+  videoEl.src = src;
+}
+
+function observeLazyVideo(videoEl) {
+  if (!('IntersectionObserver' in window)) {
+    loadLazyVideo(videoEl);
+    return;
+  }
+  if (!videoLazyIO) {
+    videoLazyIO = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        loadLazyVideo(entry.target);
+        videoLazyIO.unobserve(entry.target);
+      });
+    }, { root: null, rootMargin: '400px 0px' });
+  }
+  videoLazyIO.observe(videoEl);
+}
+
 function drawVideoCell(cell, shot) {
   cell.innerHTML = '';
   cell.classList.remove('drag-over');
@@ -2564,8 +2809,9 @@ function drawVideoCell(cell, shot) {
   const video = document.createElement('video');
   video.muted = true;
   video.playsInline = true;
-  video.preload = 'metadata';
-  video.src = mediaUrl(ref);
+  video.preload = 'none';
+  video.dataset.src = mediaUrl(ref);
+  observeLazyVideo(video);
   video.addEventListener('loadedmetadata', () => {
     const t = ref.in || 0;
     if (t > 0 && Number.isFinite(video.duration)) {
@@ -3024,6 +3270,17 @@ function bindPanel() {
   });
 
   changeClipBtn.addEventListener('click', () => {
+    // 换片前保存现场：新原片上传成功才清理旧文件，失败/取消时恢复旧剪辑状态
+    pendingClipReplace = state.clip
+      ? {
+          clip: { file: state.clip.file, url: state.clip.url, name: state.clip.name },
+          cuts: state.cuts.slice(),
+          fps: state.fps,
+          duration: state.clipDuration,
+          product: state.product,
+          script: state.script,
+        }
+      : null;
     resetClipPanel();
     saveEdit();
   });
@@ -3061,6 +3318,16 @@ async function loadClipFile(file) {
     toast('请选择视频文件');
     return;
   }
+  // 上传前记下正在用的原片：上传成功后如果换成了新文件，旧文件按引用计数决定是否清理
+  const snap = pendingClipReplace && pendingClipReplace.product === state.product && pendingClipReplace.script === state.script
+    ? pendingClipReplace
+    : null;
+  const previous = snap
+    ? snap.clip
+    : (state.clip && state.clip.file ? { file: state.clip.file, name: state.clip.name || state.clip.file } : null);
+  const ctx = snap
+    ? { product: snap.product, script: snap.script }
+    : { product: state.product, script: state.script };
   clipDrop.classList.add('uploading');
   const cancel = el('button', 'upload-cancel-btn', '取消上传');
   cancel.type = 'button';
@@ -3078,6 +3345,7 @@ async function loadClipFile(file) {
     url: '/api/temp',
     label: '导入原片 · ' + file.name,
     onSuccess: (data) => {
+      pendingClipReplace = null;
       resetClipPanel();
       state.clip = {
         file: data.file,
@@ -3100,16 +3368,69 @@ async function loadClipFile(file) {
       probeClip(data.file);
       saveEdit();
       finish();
+      if (previous && previous.file !== data.file) releaseOldSource(previous, ctx);
     },
     onFail: (err) => {
-      toast('导入失败：' + err.message + '（可在上传队列点「重试」）', 4200);
+      toast('导入失败：' + err.message + '（旧原片保持不变，可在上传队列点「重试」）', 4200);
+      restoreClipReplace();
       finish();
     },
     onCancel: () => {
-      toast('已取消导入');
+      toast('已取消导入，旧原片保持不变');
+      restoreClipReplace();
       finish();
     },
   });
+}
+
+// 换片失败 / 取消时，把面板恢复到点击「更换视频」之前的样子。
+function restoreClipReplace() {
+  const snap = pendingClipReplace;
+  pendingClipReplace = null;
+  if (!snap || !snap.clip || snap.product !== state.product || snap.script !== state.script) return;
+  state.clip = { file: snap.clip.file, url: snap.clip.url, name: snap.clip.name };
+  state.cuts = snap.cuts.slice();
+  state.fps = snap.fps > 1 ? snap.fps : 30;
+  state.clipDuration = Number(snap.duration) || 0;
+  clipName.textContent = state.clip.name || state.clip.file;
+  clipName.title = state.clip.name || state.clip.file;
+  clipDrop.classList.add('hidden');
+  clipEditor.classList.remove('hidden');
+  clipVideo.src = state.clip.url;
+  clipVideo.load();
+  renderTimelineCuts();
+  renderSegments();
+  updateFrameLabels();
+  updateSmartCut();
+  saveEdit();
+}
+
+// 更换原片后清理旧文件：服务端按全库引用计数判断，仍被镜头或其它脚本引用就保留。
+async function releaseOldSource(prev, ctx) {
+  if (!prev || !prev.file || !ctx || !ctx.product || !ctx.script) return;
+  try {
+    await flushNow();
+  } catch (_) { /* ignore */ }
+  try {
+    const res = await api('/api/media/release-temp', {
+      method: 'POST',
+      body: {
+        product: ctx.product,
+        script: ctx.script,
+        file: prev.file,
+        name: me && me.name,
+        waitMs: 2500,
+      },
+    });
+    if (!res) return;
+    if (res.deleted) {
+      toast('已清理旧原片，释放 ' + humanSize(res.freed), 3600);
+    } else if (Number(res.refs) > 0) {
+      toast('旧原片仍被 ' + res.refs + ' 处引用，已保留', 3600);
+    }
+  } catch (err) {
+    toast('旧原片清理失败：' + err.message, 4200);
+  }
 }
 
 /* 重置剪辑面板（不保存），用于切换脚本 / 更换视频 */
@@ -3792,7 +4113,7 @@ function renderHistory(items) {
     historyList.appendChild(el('div', 'history-empty', '还没有修改记录。协作编辑与「使用 / 删除」都会自动记录。'));
     return;
   }
-  const kindLabel = { add: '新增', del: '删除', text: '文案', no: '序号', video: '素材', status: '状态', rollback: '回滚' };
+  const kindLabel = { add: '新增', del: '删除', text: '文案', no: '序号', video: '素材', status: '状态', media: '清理', rollback: '回滚' };
   items.forEach((it) => {
     const row = el('div', 'history-row');
     const top = el('div', 'history-row-top');
@@ -3808,7 +4129,7 @@ function renderHistory(items) {
       diff.appendChild(el('span', 'history-next', it.next || '（空）'));
       row.appendChild(diff);
     }
-    if (it.kind !== 'status' && it.kind !== 'rollback') {
+    if (it.kind !== 'status' && it.kind !== 'rollback' && it.kind !== 'media') {
       const btn = el('button', 'mini-btn history-rollback', '回滚到此前');
       btn.type = 'button';
       btn.addEventListener('click', () => askRollback(it));
@@ -4109,6 +4430,7 @@ async function copyExportPaths() {
 /* ============ 全局事件 ============ */
 function bindGlobal() {
   addProductBtn.addEventListener('click', createProduct);
+  if (delProductBtn) delProductBtn.addEventListener('click', askDeleteProduct);
   addScriptBtn.addEventListener('click', createScript);
   productSelect.addEventListener('change', () => selectProduct(productSelect.value));
 
@@ -4158,6 +4480,203 @@ function bindGlobal() {
     if (e.target.closest('.video-cell, .clip-drop, .segment')) return;
     if (hasFileDrag(e)) e.preventDefault();
   });
+}
+
+/* ============ 清理未引用的视频 ============ */
+const orphanUi = { files: [], selected: new Set(), busy: false };
+
+function bindOrphans() {
+  const mOrphans = $('#mOrphans');
+  if (mOrphans) {
+    mOrphans.addEventListener('click', () => {
+      openMobileMenu(false);
+      openOrphans();
+    });
+  }
+  if (orphanOpen) orphanOpen.addEventListener('click', openOrphans);
+  if (orphanClose) orphanClose.addEventListener('click', closeOrphans);
+  if (orphanRescan) orphanRescan.addEventListener('click', scanOrphans);
+  if (orphanDelete) orphanDelete.addEventListener('click', confirmDeleteOrphans);
+  if (orphanAll) {
+    orphanAll.addEventListener('change', () => {
+      orphanUi.selected.clear();
+      if (orphanAll.checked) orphanUi.files.forEach((f) => orphanUi.selected.add(f.path));
+      renderOrphanSelection();
+    });
+  }
+  if (orphanModal) {
+    orphanModal.addEventListener('mousedown', (e) => {
+      if (e.target === orphanModal) closeOrphans();
+    });
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && orphanModal && !orphanModal.classList.contains('hidden')) closeOrphans();
+  });
+}
+
+function openOrphans() {
+  if (!orphanModal) return;
+  orphanModal.classList.remove('hidden');
+  scanOrphans();
+}
+
+function closeOrphans() {
+  if (!orphanModal) return;
+  if (orphanUi.busy) {
+    toast('扫描或删除还在进行，请稍等', 2600);
+    return;
+  }
+  orphanModal.classList.add('hidden');
+}
+
+function humanSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return v.toFixed(1) + ' ' + units[i];
+}
+
+function showOrphanNote(text, kind) {
+  if (!orphanNote) return;
+  orphanNote.textContent = text;
+  orphanNote.className = 'orphan-note' + (kind ? ' ' + kind : '');
+  orphanNote.classList.remove('hidden');
+}
+
+async function scanOrphans() {
+  if (!orphanModal || orphanUi.busy) return;
+  orphanUi.busy = true;
+  orphanUi.files = [];
+  orphanUi.selected.clear();
+  orphanList.innerHTML = '';
+  if (orphanAll) orphanAll.checked = false;
+  if (orphanNote) orphanNote.classList.add('hidden');
+  orphanSummary.textContent = '正在扫描数据目录…';
+  renderOrphanSelection();
+  try {
+    const data = await api('/api/media/orphans');
+    orphanUi.files = Array.isArray(data.files) ? data.files : [];
+    renderOrphanRows(data);
+  } catch (err) {
+    orphanSummary.textContent = '扫描失败：' + err.message;
+    showOrphanNote('扫描失败：' + err.message, 'err');
+  } finally {
+    orphanUi.busy = false;
+    renderOrphanSelection();
+  }
+}
+
+function renderOrphanRows(data) {
+  orphanList.innerHTML = '';
+  const files = orphanUi.files;
+  const total = files.reduce((sum, f) => sum + (Number(f.size) || 0), 0);
+  if (!files.length) {
+    orphanSummary.textContent = '没有发现未被引用的视频。';
+    orphanList.appendChild(el('div', 'orphan-empty', '数据目录很干净，暂时不需要清理。'));
+  } else {
+    orphanSummary.textContent = `发现 ${files.length} 个未被引用的视频，合计 ${humanSize(total)}。`;
+  }
+  const recent = (data && data.recentCount) || 0;
+  const minAge = (data && data.minAgeMinutes) || 10;
+  if (recent > 0) {
+    orphanSummary.textContent += ` 另有 ${recent} 个最近 ${minAge} 分钟内上传的文件暂不清理。`;
+  }
+  const residue = (data && data.residueCount) || 0;
+  if (residue > 0) {
+    orphanSummary.textContent += ` 其中 ${residue} 个是上传 / 写入中断留下的临时残留文件。`;
+  }
+  files.forEach((f) => {
+    const row = el('label', 'orphan-row');
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = orphanUi.selected.has(f.path);
+    box.addEventListener('change', () => {
+      if (box.checked) orphanUi.selected.add(f.path);
+      else orphanUi.selected.delete(f.path);
+      renderOrphanSelection();
+    });
+    row.appendChild(box);
+    const main = el('span', 'orphan-main');
+    main.appendChild(el('span', 'orphan-name', f.name || f.path));
+    const where = f.scope === 'residue'
+      ? '临时残留（上传 / 写入中断留下）'
+      : f.scope === 'temp'
+        ? '剪辑素材（_剪辑素材）'
+        : (f.product || '') + ' / ' + (f.script || '');
+    main.appendChild(el('span', 'orphan-sub', f.path + ' · ' + where));
+    row.appendChild(main);
+    row.appendChild(el('span', 'orphan-size', humanSize(f.size)));
+    orphanList.appendChild(row);
+  });
+  renderOrphanSelection();
+  if (data && data.recent && data.recent.length) {
+    const last = data.recent[0];
+    showOrphanNote('最近一次清理：' + (last.at || '') + ' · ' + (last.by || '同事') + ' · ' + (last.text || ''), '');
+  }
+}
+
+function renderOrphanSelection() {
+  if (!orphanSelected) return;
+  const n = orphanUi.selected.size;
+  const size = orphanUi.files
+    .filter((f) => orphanUi.selected.has(f.path))
+    .reduce((sum, f) => sum + (Number(f.size) || 0), 0);
+  orphanSelected.textContent = n ? `已选 ${n} 个 · ${humanSize(size)}` : '未选择文件';
+  if (orphanAll) {
+    orphanAll.checked = orphanUi.files.length > 0 && n === orphanUi.files.length;
+    orphanAll.indeterminate = n > 0 && n < orphanUi.files.length;
+  }
+  if (orphanDelete) orphanDelete.disabled = orphanUi.busy || n === 0;
+}
+
+function confirmDeleteOrphans() {
+  const paths = Array.from(orphanUi.selected);
+  if (!paths.length) return;
+  const size = orphanUi.files
+    .filter((f) => orphanUi.selected.has(f.path))
+    .reduce((sum, f) => sum + (Number(f.size) || 0), 0);
+  openConfirm({
+    title: `删除选中的 ${paths.length} 个视频？`,
+    desc: `将释放约 ${humanSize(size)}。删除后无法恢复；回滚到旧版本也不会恢复已删除的视频文件。剪映草稿目录不会被删除。`,
+    confirmText: '确认删除',
+    onConfirm: () => deleteOrphans(paths),
+  });
+}
+
+async function deleteOrphans(paths) {
+  orphanUi.busy = true;
+  renderOrphanSelection();
+  let message = '';
+  try {
+    const data = await api('/api/media/orphans', {
+      method: 'POST',
+      body: { paths, confirm: true, name: me && me.name },
+    });
+    message = data.message || '已清理';
+    const failed = data.failed || [];
+    const skipped = data.skipped || [];
+    if (failed.length) message += `；${failed.length} 个删除失败（可能被占用或没有权限），已记录日志`;
+    if (skipped.length) message += `；${skipped.length} 个已跳过`;
+    toast(message, 4200);
+    orphanUi.busy = false;
+    await scanOrphans();
+    let detail = message;
+    if (failed.length) detail += '\n' + failed.map((f) => '· ' + f.path + '：' + f.error).join('\n');
+    if (skipped.length) detail += '\n' + skipped.map((f) => '· ' + f.path + '：' + f.error).join('\n');
+    showOrphanNote(detail, failed.length ? 'err' : '');
+  } catch (err) {
+    toast('清理失败：' + err.message, 3600);
+    showOrphanNote('清理失败：' + err.message, 'err');
+  } finally {
+    orphanUi.busy = false;
+    renderOrphanSelection();
+  }
 }
 
 /* ============ Toast ============ */
